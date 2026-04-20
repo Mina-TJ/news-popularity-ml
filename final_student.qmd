@@ -1,0 +1,1830 @@
+---
+title: "Final Project — Predicting Article Popularity in Online News Media"
+subtitle: "MBAN 5560 - Due April 12, 2026 (Sunday) 11:59pm"
+author: "Mina TavakkoliJouybari"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+Claude (Anthropic, claude.ai) was used to assist with writing and debugging R code, structuring the analysis. All results and conclusions are based on my own code execution and actual outputs.
+## Background 
+
+The rapid growth of online news media has transformed the way information is disseminated and consumed. With an increasing number of news articles published daily, it has become crucial for publishers and content creators to understand the factors that drive the popularity of their articles to effectively engage their audience.
+
+This project leverages the **Online News Popularity** dataset to develop machine learning models that predict the popularity of news articles published on [Mashable](https://mashable.com), a leading online news platform. The dataset contains **39,644 articles** described by **61 features**, including content-related attributes (word counts, keywords, sentiment), publishing metadata (day of week, data channel), and the number of social media shares each article received.
+
+**Your objectives are to:**
+
+1. Explore and understand the dataset through descriptive analysis and visualization.
+2. Build **regression models** that predict the number of shares (continuous popularity measure).
+3. Build **classification models** that categorize articles as "popular" or "not popular" based on a threshold.
+4. Interpret your best models and provide **actionable insights** for content creators.
+
+**Important Notes:**
+
+- You may work individually or in **teams of up to three students**. Submit one project per team.
+- The final project is worth **100 points**, with each of the four main parts worth **25 points**.
+- Use R and Quarto for your analysis. Submit the rendered **HTML file** along with the **QMD source file**.
+- **Submissions missing the HTML file will incur a 20% penalty.**
+- **Late submissions will not be accepted.**
+- Using LLM assistance is allowed, but you must disclose which tool you used and how it helped.
+- You **cannot** use the `caret` package nor `h2o` for hyperparameter tuning.
+- Make sure your code runs without errors and produces the expected outputs.
+- Provide interpretations and explanations for your results, not just code outputs.
+
+> ⚠️ **Computational Note:** This dataset has **~40,000 observations**. Training tree-based models (especially with hyperparameter grid searches and bootstrap uncertainty estimation) can take **significant time** — potentially 1–2 hours for the full pipeline depending on your machine. To manage this:
+>
+> - Use `cache=TRUE` in your code chunk headers (e.g., `` ```{r my-chunk, cache=TRUE} ``) so that expensive computations are only run once and cached for subsequent renders.
+> - Use **parallel computing** with the `doParallel` package to distribute independent iterations across your CPU cores. This works on both **Mac and Windows**:
+>
+>   ```r
+>   library(doParallel)
+>   cl <- makeCluster(detectCores() - 1)
+>   registerDoParallel(cl)
+>   results <- foreach(i = 1:100, .combine = c,
+>                      .packages = c('randomForest')) %dopar% {
+>     # your iteration here
+>   }
+>   stopCluster(cl)
+>   ```
+>
+> - **Where to use parallel computing:**
+>   - **Bootstrap uncertainty loops** (Sections 2.6 and 3.6) — 100 independent model fits, each on a bootstrap sample → ideal for `foreach %dopar%`. This is the most impactful place to parallelize.
+>   - **GBM grid search** (Sections 2.4 and 3.4) — each hyperparameter configuration is independent → you can parallelize the outer grid loop with `foreach`. Each iteration calls `gbm(..., cv.folds = 5)` internally.
+>   - **XGBoost grid search** (Sections 2.5 and 3.5) — leave **sequential**. XGBoost already uses multi-threading internally, so parallelizing the outer loop would compete for CPU cores and may not help.
+>   - **Stacking** (Bonus) — leave sequential, as each fold trains 3 different model types sequentially.
+>
+> - During development, consider testing with a **smaller subsample** (e.g., 10,000 rows) and smaller grids, then run the full dataset for your final submission.
+> - Start your final render early — don't leave it to the last night!
+
+**Required Models:** For both regression and classification tasks, you must train and compare **all three** of the following algorithms:
+
+- **Random Forest** (using the `randomForest` package)
+- **GBM** (using the `gbm` package)
+- **XGBoost** (using the `xgboost` package)
+
+Each must be compared against a **benchmark model** (linear regression for regression; logistic regression for classification).
+
+## Data
+
+Download the **Online News Popularity** dataset from **Brightspace**. The dataset is originally from the [UCI Machine Learning Repository](https://archive.ics.uci.edu/dataset/332/online+news+popularity).
+
+Some features within the dataset may require further elaboration:
+
+- **`kw_min_min`**: The minimum number of shares among articles with the least popular keyword in the metadata. For example, if an article has keywords A (min shares = 10), B (min shares = 20), and C (min shares = 15), then `kw_min_min` = 10.
+
+- **`self_reference_min_shares`**: The minimum number of shares among all Mashable articles referenced within the current article.
+
+- **LDA features** (`LDA_00` through `LDA_04`): Probabilities of the article belonging to each of five precomputed topics derived using Latent Dirichlet Allocation. These sum to 1 for each article.
+
+- **Sentiment features**: `global_sentiment_polarity` (overall sentiment, −1 to 1), `global_rate_positive_words`, `global_rate_negative_words`, `avg_positive_polarity`, `min_positive_polarity`, `max_positive_polarity`, `avg_negative_polarity`, `min_negative_polarity`, `max_negative_polarity`.
+
+```{r setup}
+# Load all required libraries here
+library(tidyverse)
+library(randomForest)
+library(gbm)
+library(xgboost)
+library(ROCR)
+library(rpart)
+library(pdp)
+library(knitr)
+library(kableExtra)
+library(doParallel)  # for parallel bootstrap loops (works on Mac and Windows)
+```
+
+---
+
+# Part 1: Data Preparation & Exploratory Analysis (25 points) {#part1}
+
+Before building models, you must thoroughly explore and understand the dataset. This section requires you to load, clean, and summarize the data, then produce informative tables and visualizations.
+
+## 1.1 Data Loading & Cleaning (5 points)
+
+Load the dataset, inspect its structure, and handle any data quality issues.
+
+```{r data-loading}
+# 1. Load the dataset (read the CSV file)
+news <- read.csv("OnlineNewsPopularity.csv")
+# 2. Inspect structure with str() or glimpse()
+glimpse(news)
+# 3. Check for missing values: colSums(is.na(...))
+colSums(is.na(news))
+# 4. Remove non-predictive columns: "url" and "timedelta"
+news <- news %>%
+  select(-url, -timedelta)
+# 5. Check for any anomalous values (e.g., negative shares, impossible ranges)
+# Check for negative shares (impossible)
+sum(news$shares <= 0)
+
+# Check for negative word counts (impossible)
+sum(news$n_tokens_content < 0)
+
+# Check range of shares
+summary(news$shares)
+# 6. Report the dimensions of the cleaned dataset
+dim(news)
+
+```
+
+#### **Question 1 (5 points):** How many observations and features are in the cleaned dataset? Are there any missing values? Describe any data quality issues you found and how you addressed them. What is the distribution of the target variable `shares`? Is it skewed? Should you consider a transformation (e.g., log)?
+
+**Your Answer:**
+Observations & Features:
+After removing url and timedelta, the dataset contains 39,644 observations and 59 features (including shares) .
+
+Missing Values:
+There are no missing values in the dataset.
+
+Data Quality Issues:
+
+No anomalies were detected:
+No negative shares
+No negative word counts
+All values are within reasonable ranges
+
+Distribution of shares:
+The distribution is highly right-skewed:
+Median = 1,400
+Mean = 3,395
+Max = 843,300
+A small number of viral articles significantly increase the mean.
+
+Transformation:
+A log transformation of shares is recommended to reduce skewness and improve model performance.
+---
+
+## 1.2 Summary Statistics (5 points)
+
+Produce a summary statistics table for all continuous features in the dataset.
+
+```{r summary-stats}
+# 1. Compute summary statistics: mean, median, SD, min, max for all continuous features
+continuous_features <- news %>%
+  select(-starts_with("data_channel_is_"),
+         -starts_with("weekday_is_"),
+         -is_weekend)
+
+summary_table <- continuous_features %>%
+  summarise(across(everything(), list(
+    Mean   = ~round(mean(.), 2),
+    Median = ~round(median(.), 2),
+    SD     = ~round(sd(.), 2),
+    Min    = ~round(min(.), 2),
+    Max    = ~round(max(.), 2)
+  ))) %>%
+  pivot_longer(everything(),
+               names_to = c("Feature", "Stat"),
+               names_sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = Stat, values_from = value)
+
+# 2. Present as a well-formatted table using kable() and kableExtra
+summary_table %>%
+  kable(caption = "Summary Statistics for Continuous Features",
+        format = "html",
+        digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12) %>%
+  scroll_box(height = "400px")
+
+# 3. Highlight any features with unusual distributions (high skewness, outliers)
+skewness_table <- continuous_features %>%
+  summarise(across(everything(), 
+                   ~round((mean(.) - median(.)) / sd(.), 3))) %>%
+  pivot_longer(everything(), 
+               names_to = "Feature", 
+               values_to = "Skewness_Proxy") %>%
+  arrange(desc(abs(Skewness_Proxy)))
+
+skewness_table %>%
+  kable(caption = "Features Ranked by Skewness (Mean-Median / SD)",
+        format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12) %>%
+  scroll_box(height = "300px")
+```
+
+#### **Question 2 (5 points):** Examine the summary statistics table. Which features have the most extreme ranges or highest variability? Are there features that might need special treatment (e.g., scaling, transformation, outlier removal)? Identify any pairs of features that might be highly correlated and discuss implications for modeling.
+
+**Your Answer:**
+Looking at the summary table, a few things immediately stand out.
+The most extreme features are shares, self_reference_max_shares, kw_max_min, and kw_min_max — all hitting a maximum of 843,300. That is a massive range. The reason is a small number of viral articles that got shared hundreds of thousands of times, pulling everything up. Most articles are nowhere near that number.
+
+For features that need special treatment, shares is the obvious one. Its mean is 3,395 but its median is only 1,400 — when the mean is more than double the median, that is a textbook sign of right skew. The same pattern shows up in self_reference_min_shares, self_reference_max_shares, num_imgs, and num_videos. I will use log transformation on shares in Part 2 to deal with this.
+One small oddity worth noting: kw_min_min has a minimum of -1, which makes no sense for a share count. This is actually intentional in this dataset — the creators used -1 as a code meaning "no keyword data available." It is not a real error, so I leave it alone.
+
+On correlation, three groups of features are almost certainly measuring the same underlying thing. rate_positive_words and rate_negative_words move in opposite directions by definition. The three self_reference variables all capture how much previous Mashable articles were shared. And the five LDA topic probabilities always sum to 1, making them mathematically linked. This multicollinearity is not a problem for Random Forest, GBM, or XGBoost, but it will make our linear regression benchmark harder to interpret.
+---
+
+## 1.3 Popularity Categories & Distribution (5 points)
+
+Create a binary popularity variable and examine its distribution.
+
+```{r popularity-distribution}
+# 1. Compute the median of shares
+median_shares <- median(news$shares)
+cat("Median number of shares:", median_shares, "\n")
+
+# 2. Create a binary variable: "Popular" if shares >= median, "Not Popular" otherwise
+news <- news %>%
+  mutate(popular = ifelse(shares >= median_shares, "Popular", "Not Popular"))
+
+# 3. Present a frequency table showing counts and proportions for each category
+freq_table <- news %>%
+  count(popular) %>%
+  mutate(Proportion = round(n / sum(n) * 100, 2)) %>%
+  rename(Category = popular, Count = n)
+
+# 4. Use kable() and kableExtra for a polished table
+freq_table %>%
+  kable(caption = "Distribution of Popularity Categories",
+        format = "html",
+        col.names = c("Category", "Count", "Proportion (%)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12)
+```
+
+#### **Question 3 (5 points):** What is the median number of shares? What is the class distribution after creating the binary target? Is the dataset balanced? Why is the median a reasonable threshold choice? Discuss implications of this threshold for the classification task.
+
+**Your Answer:**
+The median number of shares is 1,400. That means half of all articles on Mashable got fewer than 1,400 shares and half got more.
+
+After splitting on that threshold, I get 21,154 popular articles (53.36%) and 18,490 not popular articles (46.64%). The dataset is pretty well balanced — I do not have a situation where one class dominates the other, which is great news for building classification models.
+
+Why use the median as the threshold? Because the mean (3,395) is heavily pulled up by a few viral articles. If I used the mean, I would end up labeling almost 70% of articles as "not popular," which would be unfair and misleading. The median gives us a much more natural and balanced split — it simply answers the question "did this article perform better than the average Mashable article?"
+
+The near 50/50 split also means our classification models will not be biased toward predicting one class over the other, which makes evaluation metrics like AUC and accuracy more reliable and meaningful.
+---
+
+## 1.4 Data Channels & Weekday Distributions (5 points)
+
+Examine how articles are distributed across data channels and publication days.
+
+```{r channel-distribution}
+# 1. The dataset has binary columns for data channels:
+#    data_channel_is_lifestyle, data_channel_is_entertainment,
+#    data_channel_is_bus, data_channel_is_socmed,
+#    data_channel_is_tech, data_channel_is_world
+
+# 2. Create a single "channel" variable from these binary columns
+news <- news %>%
+  mutate(channel = case_when(
+    data_channel_is_lifestyle      == 1 ~ "Lifestyle",
+    data_channel_is_entertainment  == 1 ~ "Entertainment",
+    data_channel_is_bus            == 1 ~ "Business",
+    data_channel_is_socmed         == 1 ~ "Social Media",
+    data_channel_is_tech           == 1 ~ "Tech",
+    data_channel_is_world          == 1 ~ "World",
+    TRUE                               ~ "Other"
+  ))
+
+# 3. Produce a frequency table of articles per channel
+channel_freq <- news %>%
+  count(channel) %>%
+  mutate(Proportion = round(n / sum(n) * 100, 2)) %>%
+  rename(Channel = channel, Count = n)
+
+channel_freq %>%
+  kable(caption = "Number of Articles per Data Channel",
+        format = "html",
+        col.names = c("Channel", "Count", "Proportion (%)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12)
+
+# 4. Cross-tabulate channels with popularity categories
+channel_pop <- news %>%
+  count(channel, popular) %>%
+  group_by(channel) %>%
+  mutate(Proportion = round(n / sum(n) * 100, 2)) %>%
+  ungroup() %>%
+  rename(Channel = channel, Category = popular, Count = n)
+
+channel_pop %>%
+  kable(caption = "Popularity Distribution by Channel",
+        format = "html",
+        col.names = c("Channel", "Category", "Count", "Proportion (%)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12)
+```
+
+```{r weekday-distribution}
+# 1. The dataset has binary columns for weekdays:
+#    weekday_is_monday through weekday_is_sunday
+
+# 2. Create a single "weekday" variable
+news <- news %>%
+  mutate(weekday = case_when(
+    weekday_is_monday    == 1 ~ "Monday",
+    weekday_is_tuesday   == 1 ~ "Tuesday",
+    weekday_is_wednesday == 1 ~ "Wednesday",
+    weekday_is_thursday  == 1 ~ "Thursday",
+    weekday_is_friday    == 1 ~ "Friday",
+    weekday_is_saturday  == 1 ~ "Saturday",
+    weekday_is_sunday    == 1 ~ "Sunday",
+    TRUE                     ~ "Unknown"
+  ))
+
+# 3. Produce a frequency table of articles per weekday
+weekday_freq <- news %>%
+  count(weekday) %>%
+  mutate(Proportion = round(n / sum(n) * 100, 2)) %>%
+  rename(Weekday = weekday, Count = n)
+
+weekday_freq %>%
+  kable(caption = "Number of Articles per Weekday",
+        format = "html",
+        col.names = c("Weekday", "Count", "Proportion (%)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12)
+
+# 4. Cross-tabulate weekdays with popularity categories
+weekday_pop <- news %>%
+  count(weekday, popular) %>%
+  group_by(weekday) %>%
+  mutate(Proportion = round(n / sum(n) * 100, 2)) %>%
+  ungroup() %>%
+  rename(Weekday = weekday, Category = popular, Count = n)
+
+weekday_pop %>%
+  kable(caption = "Popularity Distribution by Weekday",
+        format = "html",
+        col.names = c("Weekday", "Category", "Count", "Proportion (%)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size = 12)
+```
+
+#### **Question 4 (5 points):** Which data channel has the most articles? Which has the highest proportion of popular articles? Are there differences in popularity across weekdays? Do you notice any patterns that might be useful for modeling?
+
+**Your Answer:**
+Which channel has the most articles?
+World has the most articles with 8,427 (21.26% of all articles), followed closely by Tech with 7,346 (18.53%) and Entertainment with 7,057 (17.80%).
+
+Which channel has the highest proportion of popular articles?
+Social Media is the clear winner here — 75.76% of its articles are popular. That is remarkable. Tech and Other channels also do well, both around 64% popular. On the other end, World and Entertainment actually have more unpopular articles than popular ones, at 61.45% and 58.88% not popular respectively. So writing for World or Entertainment gives you a lower chance of going viral compared to Social Media or Tech.
+
+Are there differences in popularity across weekdays?
+Yes, and the weekend pattern is very striking. Saturday has 74.52% popular articles and Sunday has 68.72% — both are well above the overall average of 53.36%. This makes sense intuitively: fewer articles are published on weekends, so each one faces less competition and likely gets more attention from readers browsing leisurely.
+Weekdays are much more competitive. Tuesday, Wednesday, and Thursday are actually slightly below 50% popular, meaning more than half of articles published on those days fail to reach the median threshold.
+
+Patterns useful for modeling?
+Both channel and weekday show clear relationships with popularity, so they will likely show up as important features in our models. Publishing on a weekend and choosing a Social Media or Tech angle seems to give articles a meaningful popularity boost.
+
+---
+
+## 1.5 Visualizations (5 points)
+
+Create informative visualizations using `ggplot2` for the distributions explored above.
+
+```{r viz-popularity}
+# 1. Bar plot of popularity categories by data channel
+ggplot(news, aes(x = reorder(channel, -table(channel)[channel]), 
+                 fill = popular)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Popular" = "#2196F3", 
+                               "Not Popular" = "#FF5722")) +
+  labs(title = "Popularity Distribution by Data Channel",
+       x = "Data Channel",
+       y = "Proportion of Articles",
+       fill = "Popularity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 2. Bar plot of popularity categories by weekday
+news$weekday <- factor(news$weekday, 
+                       levels = c("Monday", "Tuesday", "Wednesday",
+                                  "Thursday", "Friday", 
+                                  "Saturday", "Sunday"))
+
+ggplot(news, aes(x = weekday, fill = popular)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Popular" = "#2196F3", 
+                               "Not Popular" = "#FF5722")) +
+  labs(title = "Popularity Distribution by Weekday",
+       x = "Day of the Week",
+       y = "Proportion of Articles",
+       fill = "Popularity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3. Distribution of shares (consider log scale)
+ggplot(news, aes(x = shares)) +
+  geom_histogram(bins = 50, fill = "#2196F3", color = "white") +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = "Distribution of Article Shares (Log Scale)",
+       x = "Number of Shares (log scale)",
+       y = "Count of Articles") +
+  theme_minimal()
+```
+
+#### **Question 5 (5 points):** Interpret your visualizations. What patterns do you observe? How might these patterns inform your modeling approach? Are there any channels or days that stand out as particularly associated with popularity?
+
+**Your Answer:**
+The three plots together tell a really clear story about what drives article popularity on Mashable.
+
+Channel plot:
+The first thing that jumps out is how different the channels are from each other. Social Media stands out immediately — about 75% of its articles are popular, the tallest blue bar by far. Tech and Lifestyle also do well, both around 60-64% popular. World and Entertainment are the opposite story — they are mostly orange, meaning most of their articles fail to reach the median threshold. If you are a content creator choosing what to write about, this chart alone gives you a strong signal: social media and tech topics tend to resonate much more with Mashable readers.
+
+Weekday plot:
+The weekday pattern is much more subtle during the work week — Monday through Thursday all hover right around 50/50, almost no difference between them. Friday starts to tip slightly toward popular. Then the weekend completely changes the picture — Saturday jumps to 75% popular and Sunday to about 69%. This is not because weekend articles are better written, it is simply because far fewer articles get published on weekends, so each one gets more attention and shares from readers who have more free time.
+
+Shares distribution plot:
+On the log scale the distribution looks close to a bell curve centered around 1,000 shares, with a slight right tail still visible. This confirms our earlier decision to use log transformation in regression modeling.
+
+Channels and days that stand out:
+Two combinations are particularly striking. Social Media is the single strongest channel — three out of every four articles there become popular. Saturday is the single best day to publish — also about three out of four articles become popular. If forced to give one simple recommendation just from these visuals, it would be: publish a social media focused article on a Saturday. That combination gives you the highest odds of popularity based purely on the data I have explored so far.
+---
+
+# Part 2: Regression Modeling (25 points) {#part2}
+
+**Objective:** Predict the **number of shares** (`shares`) using Random Forest, GBM, and XGBoost. Compare all models against a linear regression benchmark. Report the **mean RMSPE ± SD** for the winning model using bootstrap test iterations.
+
+## 2.1 Train/Test Split (3 points)
+
+Prepare the data for regression modeling.
+
+```{r regression-split}
+# 1. Remove the binary popularity variable (if you created one) — use raw shares as the target
+news_reg <- news %>%
+  select(-popular, -channel, -weekday)
+
+# 2. Consider whether to use log(shares) as the target (recommended due to skewness)
+news_reg <- news_reg %>%
+  mutate(log_shares = log(shares)) %>%
+  select(-shares)
+
+# 3. Create an 80/20 train-test split with set.seed(42)
+set.seed(42)
+n <- nrow(news_reg)
+train_idx <- sample(1:n, size = 0.8 * n)
+
+train_reg <- news_reg[train_idx, ]
+test_reg  <- news_reg[-train_idx, ]
+
+# 4. Report dimensions of train and test sets
+cat("Training set dimensions:", dim(train_reg), "\n")
+cat("Test set dimensions:    ", dim(test_reg), "\n")
+```
+
+---
+
+## 2.2 Benchmark: Linear Regression (2 points)
+
+Fit a simple linear regression model as the benchmark.
+
+```{r lm-benchmark}
+# 1. Fit a linear regression model: lm(shares ~ ., data = train)
+lm_model <- lm(log_shares ~ ., data = train_reg)
+
+# 2. Predict on the test set
+lm_pred <- predict(lm_model, newdata = test_reg)
+
+# 3. Compute RMSPE: sqrt(mean((actual - predicted)^2))
+lm_rmspe <- sqrt(mean((test_reg$log_shares - lm_pred)^2))
+
+# 4. Report the test RMSPE
+cat("Linear Regression Test RMSPE:", round(lm_rmspe, 4), "\n")
+```
+
+---
+
+## 2.3 Random Forest (5 points)
+
+Fit a Random Forest regression model using the `randomForest` package.
+
+```{r rf-regression, cache=TRUE}
+# 1. Fit randomForest with ntree = 500, importance = TRUE, set.seed(42)
+set.seed(42)
+rf_reg_model <- randomForest(log_shares ~ .,
+                             data       = train_reg,
+                             ntree      = 500,
+                             importance = TRUE)
+
+# 2. Report OOB RMSE: sqrt(tail(model$mse, 1))
+rf_oob_rmse <- sqrt(tail(rf_reg_model$mse, 1))
+cat("Random Forest OOB RMSE:", round(rf_oob_rmse, 4), "\n")
+
+# 3. Plot OOB error convergence
+plot(sqrt(rf_reg_model$mse),
+     type  = "l",
+     col   = "#2196F3",
+     lwd   = 2,
+     xlab  = "Number of Trees",
+     ylab  = "OOB RMSE",
+     main  = "Random Forest OOB Error Convergence")
+
+# 4. Use default mtry (p/3 for regression)
+cat("Default mtry used:", rf_reg_model$mtry, "\n")
+```
+
+#### **Question 6 (5 points):** Report the OOB RMSE for your Random Forest model. What `mtry` value was used (default)? How does OOB RMSE compare to the linear regression benchmark?
+
+**Your Answer:**
+OOB RMSE and mtry:
+The Random Forest finished with an OOB RMSE of 0.8517. Remember I am predicting log(shares), so this means our predictions are off by about 0.85 on the log scale on average. The default mtry was 19, which makes sense — I have 58 predictors and the default formula for regression is p/3, so 58/3 ≈ 19. This means at each split, the model randomly considers 19 out of 58 features to find the best split. This randomness is actually what makes Random Forest powerful — it forces the trees to be different from each other, and averaging different trees gives much more stable and accurate predictions than any single tree.
+
+How does it compare to linear regression?
+Linear regression gave us an RMSPE of 0.8762. Random Forest brings that down to 0.8517. That might look like a small difference in numbers, but on the log scale it is actually meaningful — it means Random Forest is systematically making better predictions across the board. The reason is straightforward: linear regression assumes that each feature has a straight-line relationship with shares, and that features do not interact with each other. Random Forest makes neither of those assumptions. It can discover that, for example, having many images only helps if the article is also long, which is exactly the kind of pattern a straight line cannot capture.
+
+What does the convergence plot tell us?
+The plot shows the OOB RMSE starting very high at around 1.22 with just a few trees, then dropping sharply as I add more. By around 150 trees the curve is almost completely flat. From 200 to 500 trees the line is essentially a straight horizontal line. This is great news — it tells us the model has fully converged and 500 trees was the right choice. Adding more trees beyond this point would just waste computing time without improving accuracy at all.
+---
+
+## 2.4 GBM (5 points)
+
+Fit a Gradient Boosting Machine using the `gbm` package. Tune hyperparameters using internal cross-validation.
+
+```{r gbm-regression, cache=TRUE}
+# 1. Create a hyperparameter grid (shrinkage, interaction.depth, n.minobsinnode, bag.fraction)
+gbm_grid <- expand.grid(
+  shrinkage        = c(0.01, 0.05, 0.1),
+  interaction.depth = c(3, 5, 7),
+  n.minobsinnode   = c(10, 20),
+  bag.fraction     = c(0.5, 0.75)
+)
+
+cat("Total GBM configurations to try:", nrow(gbm_grid), "\n")
+
+# 2. Use gbm() with cv.folds = 5 to find optimal n.trees for each configuration
+# Set up parallel computing for GBM grid search
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+gbm_results <- foreach(i = 1:nrow(gbm_grid),
+                       .combine  = rbind,
+                       .packages = c("gbm")) %dopar% {
+  set.seed(42)
+  fit <- gbm(log_shares ~ .,
+             data              = train_reg,
+             distribution      = "gaussian",
+             n.trees           = 3000,
+             shrinkage         = gbm_grid$shrinkage[i],
+             interaction.depth = gbm_grid$interaction.depth[i],
+             n.minobsinnode    = gbm_grid$n.minobsinnode[i],
+             bag.fraction      = gbm_grid$bag.fraction[i],
+             cv.folds          = 5,
+             verbose           = FALSE)
+
+  best_n <- gbm.perf(fit, method = "cv", plot.it = FALSE)
+  cv_rmse <- sqrt(min(fit$cv.error))
+
+  data.frame(
+    shrinkage         = gbm_grid$shrinkage[i],
+    interaction.depth = gbm_grid$interaction.depth[i],
+    n.minobsinnode    = gbm_grid$n.minobsinnode[i],
+    bag.fraction      = gbm_grid$bag.fraction[i],
+    best_n_trees      = best_n,
+    cv_rmse           = round(cv_rmse, 4)
+  )
+}
+
+stopCluster(cl)
+
+# 3. Select the best hyperparameters based on CV error
+best_gbm_row <- gbm_results[which.min(gbm_results$cv_rmse), ]
+cat("Best GBM configuration:\n")
+print(best_gbm_row)
+
+# 4. Report the best configuration and its CV RMSE
+cat("\nBest CV RMSE:", round(best_gbm_row$cv_rmse, 4), "\n")
+cat("Optimal number of trees:", best_gbm_row$best_n_trees, "\n")
+
+# Train final GBM model with best hyperparameters
+set.seed(42)
+gbm_final <- gbm(log_shares ~ .,
+                 data              = train_reg,
+                 distribution      = "gaussian",
+                 n.trees           = best_gbm_row$best_n_trees,
+                 shrinkage         = best_gbm_row$shrinkage,
+                 interaction.depth = best_gbm_row$interaction.depth,
+                 n.minobsinnode    = best_gbm_row$n.minobsinnode,
+                 bag.fraction      = best_gbm_row$bag.fraction,
+                 verbose           = FALSE)
+```
+
+#### **Question 7 (5 points):** Describe your hyperparameter tuning strategy for GBM. Which hyperparameter combination performed best? How many trees were optimal? Discuss the trade-off between shrinkage and number of trees.
+
+**Your Answer:**
+
+Hyperparameter Tuning Strategy:
+To tune the GBM model, I tested 36 different combinations of hyperparameters using a grid search. The four hyperparameters I tuned were shrinkage (0.01, 0.05, 0.1), interaction depth (3, 5, 7), minimum observations per node (10, 20), and bag fraction (0.5, 0.75). For each combination, I used 5-fold cross validation with up to 3000 trees to automatically find the optimal number of trees for that specific combination. To save time on the M4 Mac, I ran all 36 configurations in parallel using the doParallel package, which cut the computation time significantly.
+
+Best Hyperparameter Combination:
+The winning combination out of all 36 configurations was shrinkage = 0.01, interaction depth = 7, minimum observations per node = 20, and bag fraction = 0.75.
+
+How Many Trees Were Optimal?
+The optimal number of trees for this best configuration was 2995 trees. This is the point where the 5-fold cross validation error was at its lowest — adding more trees beyond this point would not improve the model and could actually start overfitting the training data.
+
+Trade-off Between Shrinkage and Number of Trees:
+This trade-off is one of the most important things to understand about GBM. Shrinkage is basically the learning rate — it controls how much each new tree is allowed to contribute to the final prediction. When I used a very small shrinkage of 0.01, the model takes tiny careful steps toward the answer, which means it needs many more trees (2995 in our case) to fully learn the patterns in the data. If I had used a larger shrinkage like 0.1, the model would take bigger steps and need far fewer trees, but it risks jumping past the optimal point and making less accurate predictions. The fact that our best model used the smallest shrinkage and the most trees confirms what theory predicts — slow careful learning with many small corrections produces the most accurate and stable GBM model.
+The CV RMSE of 0.8469 is already better than both linear regression (0.8762) and Random Forest (0.8517), which is promising going into the final model comparison.
+---
+
+## 2.5 XGBoost (5 points)
+
+Fit an XGBoost regression model using the `xgboost` package. Use `xgb.cv()` with early stopping for tuning.
+
+```{r xgb-regression, cache=TRUE}
+# 1. Prepare data as xgb.DMatrix (remember: XGBoost needs numeric matrix)
+#    - Use model.matrix() to one-hot encode any categorical variables
+train_matrix <- model.matrix(log_shares ~ . - 1, data = train_reg)
+test_matrix  <- model.matrix(log_shares ~ . - 1, data = test_reg)
+train_label  <- train_reg$log_shares
+test_label   <- test_reg$log_shares
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_label)
+dtest  <- xgb.DMatrix(data = test_matrix,  label = test_label)
+
+# 2. Define parameter grid (max_depth, eta, subsample, colsample_bytree)
+xgb_grid <- expand.grid(
+  max_depth        = c(3, 5, 7),
+  eta              = c(0.01, 0.05, 0.1),
+  subsample        = c(0.7, 0.9),
+  colsample_bytree = c(0.7, 0.9)
+)
+cat("Total XGBoost configurations to try:", nrow(xgb_grid), "\n")
+
+# 3. Use xgb.cv() with early_stopping_rounds to find optimal nrounds
+xgb_results <- data.frame()
+for(i in 1:nrow(xgb_grid)){
+  set.seed(42)
+  cv_fit <- xgb.cv(
+    params = list(
+      objective        = "reg:squarederror",
+      eval_metric      = "rmse",
+      max_depth        = xgb_grid$max_depth[i],
+      eta              = xgb_grid$eta[i],
+      subsample        = xgb_grid$subsample[i],
+      colsample_bytree = xgb_grid$colsample_bytree[i]
+    ),
+    data                  = dtrain,
+    nrounds               = 3000,
+    nfold                 = 5,
+    early_stopping_rounds = 50,
+    verbose               = 0
+  )
+  # Safely extract best iteration
+  best_nrounds <- ifelse(!is.null(cv_fit$best_iteration) && 
+                         length(cv_fit$best_iteration) > 0,
+                         cv_fit$best_iteration,
+                         which.min(cv_fit$evaluation_log$test_rmse_mean))
+  
+  best_rmse <- min(cv_fit$evaluation_log$test_rmse_mean)
+  xgb_results <- rbind(xgb_results, data.frame(
+    max_depth        = xgb_grid$max_depth[i],
+    eta              = xgb_grid$eta[i],
+    subsample        = xgb_grid$subsample[i],
+    colsample_bytree = xgb_grid$colsample_bytree[i],
+    best_nrounds     = best_nrounds,
+    cv_rmse          = round(best_rmse, 4)
+  ))
+  cat("Config", i, "of", nrow(xgb_grid), "done - CV RMSE:", round(best_rmse, 4), "\n")
+}
+
+# 4. Train the final model with the best parameters
+best_xgb_row <- xgb_results[which.min(xgb_results$cv_rmse), ]
+cat("\nBest XGBoost configuration:\n")
+print(best_xgb_row)
+
+set.seed(42)
+xgb_final <- xgboost(
+  x                = train_matrix,
+  y                = train_label,
+  nrounds          = best_xgb_row$best_nrounds,
+  max_depth        = best_xgb_row$max_depth,
+  learning_rate    = best_xgb_row$eta,
+  subsample        = best_xgb_row$subsample,
+  colsample_bytree = best_xgb_row$colsample_bytree,
+  objective        = "reg:squarederror",
+  eval_metric      = "rmse"
+)
+
+# 5. Report the best CV RMSE
+cat("\nBest XGBoost CV RMSE:", round(best_xgb_row$cv_rmse, 4), "\n")
+cat("Optimal number of rounds:", best_xgb_row$best_nrounds, "\n")
+```
+
+#### **Question 8 (5 points):** Describe your XGBoost tuning strategy. How did you use early stopping? Which parameters had the most impact on performance? How does XGBoost compare to GBM in terms of speed and accuracy?
+
+**Your Answer:**
+XGBoost Tuning Strategy:
+I tested 36 different combinations of hyperparameters using a grid search, covering max_depth (3, 5, 7), eta (0.01, 0.05, 0.1), subsample (0.7, 0.9), and colsample_bytree (0.7, 0.9). For each combination I used xgb.cv() with 5-fold cross validation and a maximum of 3000 rounds to find the optimal number of trees automatically.
+
+How I Used Early Stopping:
+Early stopping is one of XGBoost's most useful features. I set early_stopping_rounds = 50, which means if the cross validation error does not improve for 50 consecutive rounds, the model stops adding trees automatically. This is smarter than just setting a fixed number of trees — it lets the model decide when it has learned enough and stops before it starts overfitting. Without early stopping, the model would keep adding trees even when they are no longer helping.
+
+Best Configuration:
+The winning combination was max_depth = 7, eta = 0.01, subsample = 0.9, and colsample_bytree = 0.7, with an optimal 1137 rounds and a CV RMSE of 0.8426. Interestingly, the best eta was again the smallest value (0.01), just like GBM — confirming that slow careful learning consistently wins with boosting algorithms on this dataset.
+
+Which Parameters Had the Most Impact:
+Looking across all 36 configurations, max_depth and eta had the most visible impact. Deeper trees (max_depth = 7) consistently outperformed shallower ones (max_depth = 3), suggesting the relationships in this data are complex and need deeper splits to capture. Higher eta values like 0.1 consistently gave worse results, confirming that learning too fast hurts accuracy.
+
+XGBoost vs GBM — Speed and Accuracy:
+XGBoost was noticeably faster than GBM despite running sequentially without parallel computing. This is because XGBoost is built with speed in mind — it uses multi-threading internally and has a much more efficient tree building algorithm. On accuracy, XGBoost achieved a CV RMSE of 0.8426, which is slightly better than GBM's 0.8469. So XGBoost wins on both speed and accuracy in this case, making it the strongest model so far.
+---
+
+## 2.6 Model Comparison — RMSPE ± SD (5 points)
+
+Compare all models on the test set. For your **best model**, report the mean RMSPE and its standard deviation using bootstrap test iterations.
+
+```{r regression-comparison}
+# 1. Predict on the test set using all 4 models (LM, RF, GBM, XGBoost)
+lm_pred   <- predict(lm_model, newdata = test_reg)
+rf_pred   <- predict(rf_reg_model, newdata = test_reg)
+gbm_pred  <- predict(gbm_final, newdata = test_reg, 
+                     n.trees = best_gbm_row$best_n_trees)
+xgb_pred  <- predict(xgb_final, newdata = test_matrix)
+
+# 2. Compute test RMSPE for each model
+lm_rmspe  <- sqrt(mean((test_reg$log_shares - lm_pred)^2))
+rf_rmspe  <- sqrt(mean((test_reg$log_shares - rf_pred)^2))
+gbm_rmspe <- sqrt(mean((test_reg$log_shares - gbm_pred)^2))
+xgb_rmspe <- sqrt(mean((test_reg$log_shares - xgb_pred)^2))
+
+# 3. Create a comparison table
+comparison_table <- data.frame(
+  Model      = c("Linear Regression", "Random Forest", "GBM", "XGBoost"),
+  Test_RMSPE = round(c(lm_rmspe, rf_rmspe, gbm_rmspe, xgb_rmspe), 4)
+)
+
+comparison_table %>%
+  arrange(Test_RMSPE) %>%
+  kable(caption = "Regression Model Comparison — Test RMSPE",
+        format  = "html",
+        col.names = c("Model", "Test RMSPE")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 12)
+```
+
+```{r regression-uncertainty, cache=TRUE}
+# For your BEST model, estimate uncertainty via bootstrap:
+# 1. Run 100 iterations:
+#    - Sample train set with replacement
+#    - Train the best model on the bootstrap sample
+#    - Predict on the OOB observations (or held-out test set)
+#    - Compute RMSPE
+
+# Set up parallel computing for bootstrap loop
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+boot_rmspe <- foreach(i = 1:100,
+                      .combine  = c,
+                      .packages = c("xgboost")) %dopar% {
+  set.seed(i)
+  
+  # Bootstrap sample from training set
+  boot_idx   <- sample(1:nrow(train_reg), replace = TRUE)
+  boot_train <- train_reg[boot_idx, ]
+  
+  # Prepare matrices
+  boot_matrix <- model.matrix(log_shares ~ . - 1, data = boot_train)
+  boot_label  <- boot_train$log_shares
+  
+  # Train XGBoost with best parameters
+  boot_model <- xgboost(
+    x                = boot_matrix,
+    y                = boot_label,
+    nrounds          = best_xgb_row$best_nrounds,
+    max_depth        = best_xgb_row$max_depth,
+    learning_rate    = best_xgb_row$eta,
+    subsample        = best_xgb_row$subsample,
+    colsample_bytree = best_xgb_row$colsample_bytree,
+    objective        = "reg:squarederror",
+    eval_metric      = "rmse"
+  )
+  
+  # Predict on test set
+  boot_pred <- predict(boot_model, newdata = test_matrix)
+  
+  # Compute RMSPE
+  sqrt(mean((test_reg$log_shares - boot_pred)^2))
+}
+
+stopCluster(cl)
+
+# 2. Report: Mean RMSPE, SD, and 95% CI
+cat("Mean RMSPE:", round(mean(boot_rmspe), 4), "\n")
+cat("SD:        ", round(sd(boot_rmspe), 4), "\n")
+cat("95% CI:    ", round(quantile(boot_rmspe, 0.025), 4),
+    "to", round(quantile(boot_rmspe, 0.975), 4), "\n")
+
+# 3. Plot the distribution of RMSPE values
+hist(boot_rmspe,
+     breaks = 30,
+     col    = "#2196F3",
+     border = "white",
+     main   = "Bootstrap Distribution of XGBoost RMSPE",
+     xlab   = "RMSPE",
+     ylab   = "Frequency")
+abline(v = mean(boot_rmspe), col = "red", lwd = 2, lty = 2)
+legend("topright", legend = "Mean RMSPE", col = "red", lwd = 2, lty = 2)
+```
+
+#### **Question 9 (5 points):** Present the comparison table of all four models. Which model achieved the lowest test RMSPE? Report the mean RMSPE ± SD for your best model. How much improvement does your best model provide over the linear regression benchmark? Are the differences between RF, GBM, and XGBoost statistically meaningful (considering the SD)?
+
+**Your Answer:**
+
+Comparison table of all four models:
+The comparison table is presented in the code output above. Here is how the four models ranked from best to worst: XGBoost came in first with a test RMSPE of 0.8462, followed by GBM at 0.8493, then Random Forest at 0.8547, and finally linear regression at the bottom with 0.8762. Every single tree-based model beat the linear regression benchmark, which is exactly what I expected given how complex and non-linear the relationships in this data are.
+
+Which model achieved the lowest test RMSPE:
+XGBoost is the winner with a test RMSPE of 0.8462. This means on average, our predictions of log(shares) are off by about 0.846 — which is the best I achieved across all four models.
+
+Mean RMSPE ± SD for the best model:
+To understand how stable and reliable XGBoost really is, I ran 100 bootstrap iterations — each time training the model on a different random sample of the training data and predicting on the test set. The result was a mean RMSPE of 0.8509 ± 0.0018, with a 95% confidence interval of 0.8475 to 0.8538. The standard deviation of 0.0018 is incredibly small, which tells us this model is rock solid. It consistently performs at the same level no matter which sample it trains on — it is not getting lucky on one particular data split.
+
+How much improvement over linear regression:
+XGBoost reduced the RMSPE from 0.8762 (linear regression) down to 0.8462 — a reduction of 0.0300, or about 3.4%. That might sound modest but remember I am working on a log scale across nearly 8,000 test articles. A consistent 3.4% improvement across all of them is genuinely meaningful. It means our XGBoost model is systematically better at capturing the complex patterns that drive article sharing behavior, patterns that a straight line simply cannot see.
+
+Are the differences between RF, GBM, and XGBoost statistically meaningful:
+Yes they are real differences, not just noise. With a bootstrap SD of only 0.0018, I can put the gaps in perspective. The difference between XGBoost and GBM is 0.0031, which is about 1.7 standard deviations — meaningful but not huge, these two boosting models are fairly close to each other. The difference between XGBoost and Random Forest is 0.0085, which is about 4.7 standard deviations — that is a very clear and significant gap. So while GBM and XGBoost are competitive with each other, both boosting methods are genuinely and substantially better than Random Forest on this particular dataset.
+
+---
+
+# Part 3: Classification Modeling (25 points) {#part3}
+
+**Objective:** Classify articles as "Popular" or "Not Popular" (based on the median shares threshold) using Random Forest, GBM, and XGBoost. Compare all models against a logistic regression benchmark. Report the **mean AUC ± SD** for the winning model.
+
+## 3.1 Create Binary Target & Train/Test Split (3 points)
+
+```{r classification-split}
+# 1. Create binary target: 1 if shares >= median, 0 otherwise
+median_shares <- median(news$shares)
+news_cls <- news %>%
+  select(-popular, -channel, -weekday) %>%
+  mutate(popular = ifelse(shares >= median_shares, 1, 0)) %>%
+  select(-shares)
+
+# 2. Convert to factor for classification models
+news_cls$popular <- factor(news_cls$popular, 
+                           levels = c(0, 1), 
+                           labels = c("Not_Popular", "Popular"))
+
+# 3. Create a stratified 80/20 train-test split with set.seed(42)
+set.seed(42)
+train_idx_cls <- sample(1:nrow(news_cls), size = 0.8 * nrow(news_cls))
+
+train_cls <- news_cls[train_idx_cls, ]
+test_cls  <- news_cls[-train_idx_cls, ]
+
+# 4. Report class distribution in train and test sets
+cat("Training set dimensions:", dim(train_cls), "\n")
+cat("Test set dimensions:    ", dim(test_cls), "\n")
+
+cat("\nClass distribution in training set:\n")
+print(table(train_cls$popular))
+print(round(prop.table(table(train_cls$popular)) * 100, 2))
+
+cat("\nClass distribution in test set:\n")
+print(table(test_cls$popular))
+print(round(prop.table(table(test_cls$popular)) * 100, 2))
+```
+
+---
+
+## 3.2 Benchmark: Logistic Regression (2 points)
+
+```{r logistic-benchmark}
+# 1. Fit logistic regression: glm(popular ~ ., data = train, family = binomial)
+logit_model <- glm(popular ~ ., 
+                   data   = train_cls, 
+                   family = binomial)
+
+# 2. Predict probabilities on the test set
+logit_prob <- predict(logit_model, 
+                      newdata = test_cls, 
+                      type    = "response")
+
+# 3. Compute AUC using ROCR
+logit_pred_obj <- prediction(logit_prob, test_cls$popular)
+logit_auc      <- performance(logit_pred_obj, measure = "auc")
+logit_auc      <- logit_auc@y.values[[1]]
+cat("Logistic Regression Test AUC:", round(logit_auc, 4), "\n")
+
+# 4. Report confusion matrix and AUC
+logit_class <- ifelse(logit_prob >= 0.5, "Popular", "Not_Popular")
+logit_class <- factor(logit_class, levels = c("Not_Popular", "Popular"))
+cat("\nConfusion Matrix:\n")
+print(table(Predicted = logit_class, Actual = test_cls$popular))
+```
+
+---
+
+## 3.3 Random Forest (5 points)
+
+```{r rf-classification, cache=TRUE}
+# 1. Fit randomForest for classification with ntree = 500, importance = TRUE, set.seed(42)
+set.seed(42)
+rf_cls_model <- randomForest(popular ~ .,
+                             data      = train_cls,
+                             ntree     = 500,
+                             importance = TRUE)
+
+# 2. Report OOB error rate and OOB AUC (using model$votes)
+cat("OOB Error Rate:", round(rf_cls_model$err.rate[500, "OOB"], 4), "\n")
+
+rf_votes      <- rf_cls_model$votes[, "Popular"]
+rf_pred_obj   <- prediction(rf_votes, train_cls$popular)
+rf_oob_auc    <- performance(rf_pred_obj, measure = "auc")
+rf_oob_auc    <- rf_oob_auc@y.values[[1]]
+cat("OOB AUC:", round(rf_oob_auc, 4), "\n")
+
+# 3. Plot OOB error convergence (overall and per-class)
+plot(rf_cls_model$err.rate[, "OOB"],
+     type  = "l",
+     col   = "black",
+     lwd   = 2,
+     ylim  = range(rf_cls_model$err.rate),
+     xlab  = "Number of Trees",
+     ylab  = "OOB Error Rate",
+     main  = "Random Forest OOB Error Convergence")
+lines(rf_cls_model$err.rate[, "Not_Popular"], col = "#FF5722", lwd = 2)
+lines(rf_cls_model$err.rate[, "Popular"],     col = "#2196F3", lwd = 2)
+legend("topright",
+       legend = c("Overall OOB", "Not Popular", "Popular"),
+       col    = c("black", "#FF5722", "#2196F3"),
+       lwd    = 2)
+
+# 4. Optionally experiment with different mtry values
+cat("Default mtry used:", rf_cls_model$mtry, "\n")
+```
+
+#### **Question 10 (5 points):** Report the OOB AUC for your Random Forest. Examine the per-class error rates — is there an asymmetry between popular and not popular articles? How does the OOB AUC compare to the logistic regression benchmark?
+
+**Your Answer:**
+OOB AUC:
+The Random Forest achieved an OOB AUC of 0.7286, which is a solid improvement over the logistic regression benchmark of 0.7067. This means Random Forest is meaningfully better at ranking articles by their likelihood of being popular — it correctly distinguishes popular from not popular articles about 73% of the time, compared to 71% for logistic regression.
+
+OOB Error Rate:
+The overall OOB error rate is 0.329, meaning the model misclassifies about 33% of articles. While that sounds high, remember this is a genuinely difficult prediction problem — predicting whether an article will go viral based on its content features alone is inherently noisy and uncertain.
+
+Per-class Error Rate Asymmetry:
+This is the most interesting finding from the plot. Looking at the two colored lines, there is a very clear asymmetry between the two classes. The Popular class (blue line) has an error rate that drops all the way down to around 0.27 by 500 trees — meaning the model is fairly good at identifying popular articles. However the Not Popular class (orange line) stays stubbornly high at around 0.40 throughout, meaning the model struggles much more with identifying articles that will not be popular.
+This makes intuitive sense — popular articles tend to share certain strong signals like topic, keywords, and timing that the model can pick up on. Unpopular articles are more varied and harder to pin down with a clear pattern.
+
+Convergence:
+Just like in regression, the error drops sharply in the first 50 trees and then flattens out completely by around 200-300 trees. Adding more trees beyond that point barely changes anything, confirming 500 trees was the right choice.
+---
+
+## 3.4 GBM (5 points)
+
+```{r gbm-classification, cache=TRUE}
+# 1. Use distribution = "bernoulli" for binary classification
+# 2. Tune hyperparameters using cv.folds
+# Create hyperparameter grid
+gbm_cls_grid <- expand.grid(
+  shrinkage         = c(0.01, 0.05, 0.1),
+  interaction.depth = c(3, 5, 7),
+  n.minobsinnode    = c(10, 20),
+  bag.fraction      = c(0.5, 0.75)
+)
+
+cat("Total GBM configurations to try:", nrow(gbm_cls_grid), "\n")
+
+# Convert target to numeric (0/1) for GBM bernoulli
+train_cls_gbm <- train_cls %>%
+  mutate(popular = ifelse(popular == "Popular", 1, 0))
+
+test_cls_gbm <- test_cls %>%
+  mutate(popular = ifelse(popular == "Popular", 1, 0))
+
+# Set up parallel computing for GBM grid search
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+gbm_cls_results <- foreach(i = 1:nrow(gbm_cls_grid),
+                           .combine  = rbind,
+                           .packages = c("gbm")) %dopar% {
+  set.seed(42)
+  fit <- gbm(popular ~ .,
+             data              = train_cls_gbm,
+             distribution      = "bernoulli",
+             n.trees           = 3000,
+             shrinkage         = gbm_cls_grid$shrinkage[i],
+             interaction.depth = gbm_cls_grid$interaction.depth[i],
+             n.minobsinnode    = gbm_cls_grid$n.minobsinnode[i],
+             bag.fraction      = gbm_cls_grid$bag.fraction[i],
+             cv.folds          = 5,
+             verbose           = FALSE)
+
+  best_n  <- gbm.perf(fit, method = "cv", plot.it = FALSE)
+  cv_loss <- min(fit$cv.error)
+
+  data.frame(
+    shrinkage         = gbm_cls_grid$shrinkage[i],
+    interaction.depth = gbm_cls_grid$interaction.depth[i],
+    n.minobsinnode    = gbm_cls_grid$n.minobsinnode[i],
+    bag.fraction      = gbm_cls_grid$bag.fraction[i],
+    best_n_trees      = best_n,
+    cv_loss           = round(cv_loss, 4)
+  )
+}
+
+stopCluster(cl)
+
+# 3. Select best configuration
+best_gbm_cls_row <- gbm_cls_results[which.min(gbm_cls_results$cv_loss), ]
+cat("Best GBM classification configuration:\n")
+print(best_gbm_cls_row)
+
+# Train final GBM classification model
+set.seed(42)
+gbm_cls_final <- gbm(popular ~ .,
+                     data              = train_cls_gbm,
+                     distribution      = "bernoulli",
+                     n.trees           = best_gbm_cls_row$best_n_trees,
+                     shrinkage         = best_gbm_cls_row$shrinkage,
+                     interaction.depth = best_gbm_cls_row$interaction.depth,
+                     n.minobsinnode    = best_gbm_cls_row$n.minobsinnode,
+                     bag.fraction      = best_gbm_cls_row$bag.fraction,
+                     verbose           = FALSE)
+
+# 4. Report CV AUC or log-loss
+cat("\nBest CV Log-Loss:", round(best_gbm_cls_row$cv_loss, 4), "\n")
+cat("Optimal number of trees:", best_gbm_cls_row$best_n_trees, "\n")
+```
+
+#### **Question 11 (5 points):** Describe your GBM tuning process for classification. Which hyperparameters were optimal? How does GBM's classification performance compare to Random Forest?
+
+**Your Answer:**
+GBM Tuning Process for Classification:
+I used the exact same grid search approach as regression — testing 36 combinations of shrinkage (0.01, 0.05, 0.1), interaction depth (3, 5, 7), minimum observations per node (10, 20), and bag fraction (0.5, 0.75). The key difference from regression is that I switched the distribution from "gaussian" to "bernoulli", which is the correct setting for binary classification. Each configuration was evaluated using 5-fold cross validation with up to 3000 trees, and all 36 configurations ran in parallel to save time.
+
+Which Hyperparameters Were Optimal:
+The winning combination was shrinkage = 0.01, interaction depth = 7, minimum observations per node = 20, and bag fraction = 0.5, with an optimal 2842 trees and a CV log-loss of 1.1985. Just like in regression, the smallest shrinkage of 0.01 won again — slow and careful learning consistently outperforms faster learning on this dataset. The deeper trees (interaction depth = 7) also won again, confirming that the patterns in this data require complex deep splits to capture properly.
+
+How Does GBM Compare to Random Forest:
+Random Forest achieved an OOB AUC of 0.7286. I will compute the GBM test AUC in the comparison section, but based on the CV log-loss being well optimized, I expect GBM to perform similarly or better than Random Forest — just as I saw in the regression task where GBM outperformed Random Forest.
+---
+
+## 3.5 XGBoost (5 points)
+
+```{r xgb-classification, cache=TRUE}
+# 1. Set objective = "binary:logistic", eval_metric = "auc"
+# Prepare data as numeric matrix for XGBoost
+train_matrix_cls <- model.matrix(popular ~ . - 1, data = train_cls)
+test_matrix_cls  <- model.matrix(popular ~ . - 1, data = test_cls)
+
+train_label_cls  <- ifelse(train_cls$popular == "Popular", 1, 0)
+test_label_cls   <- ifelse(test_cls$popular  == "Popular", 1, 0)
+
+dtrain_cls <- xgb.DMatrix(data = train_matrix_cls, label = train_label_cls)
+dtest_cls  <- xgb.DMatrix(data = test_matrix_cls,  label = test_label_cls)
+
+# 2. Use xgb.cv() with early stopping to tune
+xgb_cls_grid <- expand.grid(
+  max_depth        = c(3, 5, 7),
+  eta              = c(0.01, 0.05, 0.1),
+  subsample        = c(0.7, 0.9),
+  colsample_bytree = c(0.7, 0.9)
+)
+
+cat("Total XGBoost configurations to try:", nrow(xgb_cls_grid), "\n")
+
+xgb_cls_results <- data.frame()
+
+for(i in 1:nrow(xgb_cls_grid)){
+  set.seed(42)
+  cv_fit <- xgb.cv(
+    params = list(
+      objective        = "binary:logistic",
+      eval_metric      = "auc",
+      max_depth        = xgb_cls_grid$max_depth[i],
+      eta              = xgb_cls_grid$eta[i],
+      subsample        = xgb_cls_grid$subsample[i],
+      colsample_bytree = xgb_cls_grid$colsample_bytree[i]
+    ),
+    data                  = dtrain_cls,
+    nrounds               = 3000,
+    nfold                 = 5,
+    early_stopping_rounds = 50,
+    verbose               = 0,
+    maximize              = TRUE
+  )
+
+  best_nrounds <- ifelse(!is.null(cv_fit$best_iteration) &&
+                         length(cv_fit$best_iteration) > 0,
+                         cv_fit$best_iteration,
+                         which.max(cv_fit$evaluation_log$test_auc_mean))
+
+  best_auc <- max(cv_fit$evaluation_log$test_auc_mean)
+
+  xgb_cls_results <- rbind(xgb_cls_results, data.frame(
+    max_depth        = xgb_cls_grid$max_depth[i],
+    eta              = xgb_cls_grid$eta[i],
+    subsample        = xgb_cls_grid$subsample[i],
+    colsample_bytree = xgb_cls_grid$colsample_bytree[i],
+    best_nrounds     = best_nrounds,
+    cv_auc           = round(best_auc, 4)
+  ))
+
+  cat("Config", i, "of", nrow(xgb_cls_grid), "done - CV AUC:", round(best_auc, 4), "\n")
+}
+# 3. Train final model
+best_xgb_cls_row <- xgb_cls_results[which.max(xgb_cls_results$cv_auc), ]
+cat("\nBest XGBoost classification configuration:\n")
+print(best_xgb_cls_row)
+
+set.seed(42)
+xgb_cls_final <- xgboost(
+  x                = train_matrix_cls,
+  y                = factor(train_label_cls),
+  nrounds          = best_xgb_cls_row$best_nrounds,
+  max_depth        = best_xgb_cls_row$max_depth,
+  learning_rate    = best_xgb_cls_row$eta,
+  subsample        = best_xgb_cls_row$subsample,
+  colsample_bytree = best_xgb_cls_row$colsample_bytree,
+  objective        = "binary:logistic",
+  eval_metric      = "auc"
+)
+
+# 4. Report CV AUC
+cat("\nBest XGBoost CV AUC:", round(best_xgb_cls_row$cv_auc, 4), "\n")
+cat("Optimal number of rounds:", best_xgb_cls_row$best_nrounds, "\n")
+
+```
+
+#### **Question 12 (5 points):** Describe your XGBoost tuning for classification. How does it compare to GBM and RF? Did early stopping help prevent overfitting?
+
+**Your Answer:**
+XGBoost Tuning for Classification:
+I used the same grid search approach as regression — testing 36 combinations of max_depth (3, 5, 7), eta (0.01, 0.05, 0.1), subsample (0.7, 0.9), and colsample_bytree (0.7, 0.9). The key difference from regression is setting the objective to "binary:logistic" and the evaluation metric to "auc" instead of RMSE. This tells XGBoost I am doing binary classification and I want to maximize the area under the ROC curve.
+
+Best Configuration:
+The winning combination was max_depth = 5, eta = 0.01, subsample = 0.7, and colsample_bytree = 0.7, with an optimal 1276 rounds and a CV AUC of 0.7391. Interestingly, this time a shallower tree depth of 5 won instead of 7 like in regression, suggesting that for classification the model does not need to go as deep to capture the relevant patterns.
+
+How Does it Compare to GBM and RF:
+XGBoost achieved a CV AUC of 0.7391, which is slightly better than Random Forest's OOB AUC of 0.7286. I will see the full comparison with GBM in the next section, but XGBoost appears to be the strongest classifier so far.
+
+Did Early Stopping Help Prevent Overfitting:
+Yes, absolutely. With early stopping set to 50 rounds, the model automatically stopped adding trees when the cross validation AUC stopped improving. For example, the best configuration stopped at 1276 rounds out of a maximum of 3000 — meaning it found the optimal point well before the ceiling and stopped there, avoiding overfitting completely. Without early stopping the model would have kept adding trees past the optimal point and started memorizing the training data rather than learning generalizable patterns.
+---
+
+## 3.6 Model Comparison — AUC ± SD (5 points)
+
+Compare all models on the test set. For your **best model**, report the mean AUC and its standard deviation.
+
+```{r classification-comparison}
+# 1. Predict probabilities on test set using all 4 models
+logit_prob <- predict(logit_model, newdata = test_cls, type = "response")
+
+rf_prob    <- predict(rf_cls_model, newdata = test_cls, type = "prob")[, "Popular"]
+
+gbm_prob   <- predict(gbm_cls_final, newdata = test_cls_gbm,
+                      n.trees = best_gbm_cls_row$best_n_trees,
+                      type    = "response")
+
+xgb_prob   <- predict(xgb_cls_final, newdata = test_matrix_cls)
+
+# 2. Compute test AUC for each model
+calc_auc <- function(probs, labels){
+  pred_obj <- prediction(probs, labels)
+  auc      <- performance(pred_obj, measure = "auc")
+  round(auc@y.values[[1]], 4)
+}
+
+logit_auc <- calc_auc(logit_prob, test_cls$popular)
+rf_auc    <- calc_auc(rf_prob,    test_cls$popular)
+gbm_auc   <- calc_auc(gbm_prob,   test_cls_gbm$popular)
+xgb_auc   <- calc_auc(xgb_prob,   test_label_cls)
+
+# 3. Compute confusion matrix for the best model
+xgb_class <- ifelse(xgb_prob >= 0.5, "Popular", "Not_Popular")
+xgb_class <- factor(xgb_class, levels = c("Not_Popular", "Popular"))
+cat("Confusion Matrix for Best Model (XGBoost):\n")
+print(table(Predicted = xgb_class, Actual = test_cls$popular))
+
+# 4. Create a comparison table: Model, OOB/CV AUC, Test AUC
+comparison_cls_table <- data.frame(
+  Model        = c("Logistic Regression", "Random Forest", 
+                   "GBM", "XGBoost"),
+  CV_OOB_AUC   = c("-", 
+                   round(rf_oob_auc, 4),
+                   "-",
+                   round(best_xgb_cls_row$cv_auc, 4)),
+  Test_AUC     = c(logit_auc, rf_auc, gbm_auc, xgb_auc)
+)
+
+comparison_cls_table %>%
+  arrange(desc(Test_AUC)) %>%
+  kable(caption = "Classification Model Comparison — Test AUC",
+        format  = "html",
+        col.names = c("Model", "OOB/CV AUC", "Test AUC")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE,
+                font_size  = 12)
+```
+
+```{r classification-uncertainty, cache=TRUE}
+# For your BEST model, estimate uncertainty via bootstrap:
+# 1. Run 100 iterations:
+#    - Sample train set with replacement
+#    - Train the best model
+#    - Predict on OOB/test observations
+#    - Compute AUC
+
+# Set up parallel computing for bootstrap loop
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+boot_auc <- foreach(i = 1:100,
+                    .combine  = c,
+                    .packages = c("xgboost", "ROCR")) %dopar% {
+  set.seed(i)
+  
+  # Bootstrap sample from training set
+  boot_idx   <- sample(1:nrow(train_cls), replace = TRUE)
+  boot_train <- train_cls[boot_idx, ]
+  
+  # Prepare matrices
+  boot_matrix <- model.matrix(popular ~ . - 1, data = boot_train)
+  boot_label  <- ifelse(boot_train$popular == "Popular", 1, 0)
+  
+  # Train XGBoost with best parameters
+  boot_model <- xgboost(
+    x                = boot_matrix,
+    y                = factor(boot_label),
+    nrounds          = best_xgb_cls_row$best_nrounds,
+    max_depth        = best_xgb_cls_row$max_depth,
+    learning_rate    = best_xgb_cls_row$eta,
+    subsample        = best_xgb_cls_row$subsample,
+    colsample_bytree = best_xgb_cls_row$colsample_bytree,
+    objective        = "binary:logistic",
+    eval_metric      = "auc"
+  )
+  
+  # Predict on test set
+  boot_prob <- predict(boot_model, newdata = test_matrix_cls)
+  
+  # Compute AUC
+  pred_obj <- prediction(boot_prob, test_label_cls)
+  auc      <- performance(pred_obj, measure = "auc")
+  auc@y.values[[1]]
+}
+
+stopCluster(cl)
+
+# 2. Report: Mean AUC, SD, and 95% CI
+cat("Mean AUC:", round(mean(boot_auc), 4), "\n")
+cat("SD:      ", round(sd(boot_auc), 4), "\n")
+cat("95% CI:  ", round(quantile(boot_auc, 0.025), 4),
+    "to", round(quantile(boot_auc, 0.975), 4), "\n")
+
+# 3. Plot the distribution of AUC values
+hist(boot_auc,
+     breaks = 30,
+     col    = "#2196F3",
+     border = "white",
+     main   = "Bootstrap Distribution of XGBoost AUC",
+     xlab   = "AUC",
+     ylab   = "Frequency")
+abline(v = mean(boot_auc), col = "red", lwd = 2, lty = 2)
+legend("topleft", legend = "Mean AUC", col = "red", lwd = 2, lty = 2)
+```
+
+#### **Question 13 (5 points):** Present the comparison table. Which model achieved the highest test AUC? Report the mean AUC ± SD for your best model. Present and interpret the confusion matrix — what are the precision and recall for the "Popular" class? How much improvement does your best model provide over logistic regression?
+
+**Your Answer:**
+Comparison Table:
+The comparison table is presented in the code output above. XGBoost came in first with a test AUC of 0.7422, followed by GBM at 0.7414, then Random Forest at 0.7306, and logistic regression at the bottom with 0.7067. All three tree-based models beat the logistic regression benchmark clearly.
+
+Which model achieved the highest test AUC:
+XGBoost achieved the highest test AUC of 0.7422, making it the best classifier among all four models. This means XGBoost correctly ranks a popular article above a not popular article about 74% of the time.
+
+Mean AUC and SD for the best model:
+After running 100 bootstrap iterations, XGBoost achieved a mean AUC of 0.7372 ± 0.0015, with a 95% confidence interval of 0.7341 to 0.7395. The standard deviation of just 0.0015 is extremely small, confirming the model is very stable and consistent across different training samples.
+
+Confusion Matrix interpretation:
+From the confusion matrix:
+
+True Positives (correctly predicted Popular): 3,070
+True Negatives (correctly predicted Not Popular): 2,277
+False Positives (predicted Popular but actually Not Popular): 1,419
+False Negatives (predicted Not Popular but actually Popular): 1,163
+
+Precision for the Popular class = 3,070 / (3,070 + 1,419) = 68.4% — when the model predicts an article will be popular, it is right 68% of the time.
+Recall for the Popular class = 3,070 / (3,070 + 1,163) = 72.5% — the model catches 72.5% of all actually popular articles.
+This asymmetry mirrors what I saw in Random Forest — the model is better at identifying popular articles than unpopular ones, which makes intuitive sense since popular articles tend to share stronger and more consistent signals.
+
+Improvement over logistic regression:
+XGBoost improved AUC from 0.7067 to 0.7422 — an improvement of 0.0355, or about 5% relative improvement. That is a meaningful gain in classification ability, and given the tiny bootstrap SD of 0.0015, this difference is absolutely real and not due to chance.
+---
+
+# Part 4: Model Interpretation (25 points) {#part4}
+
+**Objective:** Interpret your best models from Parts 2 and 3. Use feature importance, partial dependence plots, and your analysis to provide actionable insights for content creators.
+
+## 4.1 Feature Importance Analysis (10 points)
+
+Compute and visualize variable importance for your best regression and classification models.
+
+```{r feature-importance}
+# 1. For Random Forest: use importance() with type = 1 (%IncMSE/MDA) and type = 2 (MDI)
+rf_imp_mda <- importance(rf_reg_model, type = 1)
+rf_imp_mdi <- importance(rf_reg_model, type = 2)
+
+rf_imp_df <- data.frame(
+  Feature    = rownames(rf_imp_mda),
+  MDA        = rf_imp_mda[, 1],
+  MDI        = rf_imp_mdi[, 1]
+) %>% arrange(desc(MDA))
+
+# 2. For GBM: use summary.gbm()
+gbm_imp <- summary(gbm_final,
+                   n.trees = best_gbm_row$best_n_trees,
+                   plotit  = FALSE)
+
+# 3. For XGBoost: use xgb.importance()
+xgb_imp <- xgb.importance(model = xgb_final)
+
+# 4. Create bar charts of the top 15 most important variables
+ggplot(rf_imp_df[1:15, ], aes(x = reorder(Feature, MDA), y = MDA)) +
+  geom_bar(stat = "identity", fill = "#2196F3") +
+  coord_flip() +
+  labs(title = "Random Forest — Top 15 Features (MDA)",
+       x     = "Feature",
+       y     = "Mean Decrease in Accuracy") +
+  theme_minimal()
+
+ggplot(gbm_imp[1:15, ], aes(x = reorder(var, rel.inf), y = rel.inf)) +
+  geom_bar(stat = "identity", fill = "#FF5722") +
+  coord_flip() +
+  labs(title = "GBM — Top 15 Features (Relative Influence)",
+       x     = "Feature",
+       y     = "Relative Influence") +
+  theme_minimal()
+
+ggplot(xgb_imp[1:15, ], aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "#4CAF50") +
+  coord_flip() +
+  labs(title = "XGBoost — Top 15 Features (Gain)",
+       x     = "Feature",
+       y     = "Gain") +
+  theme_minimal()
+
+# 5. Compare rankings across models — do they agree?
+cat("Top 10 Features — Random Forest (MDA):\n")
+print(head(rf_imp_df[, c("Feature", "MDA")], 10))
+
+cat("\nTop 10 Features — GBM:\n")
+print(head(gbm_imp[, c("var", "rel.inf")], 10))
+
+cat("\nTop 10 Features — XGBoost:\n")
+print(head(xgb_imp[, c("Feature", "Gain")], 10))
+```
+
+#### **Question 14 (10 points):** Report the top 10 most important features from your best regression and classification models. Do the importance rankings agree across different models (RF, GBM, XGBoost)? Are there features that appear important in one model but not others? Explain why rankings might differ across algorithms. Which importance measure do you trust most and why?
+
+**Your Answer:**
+Top 10 Most Important Features:
+The three models produced the following rankings based on the actual results:
+Random Forest (MDA): kw_avg_avg (39.30), n_unique_tokens (38.30), LDA_00 (37.13), kw_avg_max (36.68), is_weekend (35.94), n_non_stop_unique_tokens (34.23), kw_avg_min (34.23), n_tokens_content (33.98), kw_max_avg (33.67), num_hrefs (33.12).
+GBM (Relative Influence): kw_avg_avg (19.41), kw_max_avg (6.24), self_reference_avg_sharess (6.07), self_reference_min_shares (5.98), num_hrefs (3.53), is_weekend (3.37), n_unique_tokens (2.95), LDA_02 (2.86), kw_min_avg (2.49), LDA_00 (2.09).
+XGBoost (Gain): kw_avg_avg (0.1105), kw_max_avg (0.0539), self_reference_min_shares (0.0434), self_reference_avg_sharess (0.0425), num_hrefs (0.0337), n_unique_tokens (0.0291), LDA_02 (0.0287), n_tokens_content (0.0277), kw_avg_max (0.0271), average_token_length (0.0264).
+
+Do the Rankings Agree Across Models:
+The agreement at the top is remarkable. kw_avg_avg is the single most important feature in all three models — scoring 39.30 in Random Forest MDA, 19.41 in GBM relative influence, and 0.1105 in XGBoost gain, all by a significant margin over the second-ranked feature. This is the average shares of articles with the same keywords — meaning if you use keywords associated with already-popular content, your article is much more likely to be shared widely. kw_max_avg, n_unique_tokens, num_hrefs, and is_weekend all consistently appear in the top 10 across all three models, confirming these are genuinely important drivers of popularity.
+
+Features Important in One Model But Not Others:
+LDA_00 ranks 3rd in Random Forest with an MDA of 37.13 but drops significantly in GBM (2.09) and XGBoost (0.028). On the other hand, self_reference_avg_sharess and self_reference_min_shares rank very high in GBM (6.07 and 5.98) and XGBoost (0.0425 and 0.0434) but are much less prominent in Random Forest. This tells us that how much the previously published articles were shared is a strong signal in boosting models but Random Forest distributes that importance across correlated features differently.
+
+Why Rankings Differ Across Algorithms:
+Random Forest MDA measures how much accuracy drops when a feature is randomly shuffled — it captures the overall contribution including all interactions. GBM relative influence measures how often a feature is chosen for splits weighted by the improvement it brings. XGBoost gain measures the average accuracy improvement each time a feature is used in a split. These are fundamentally different definitions of importance, so some disagreement is completely expected and normal.
+
+Which Importance Measure to Trust Most:
+I trust the features that appear consistently across all three models the most. When kw_avg_avg scores highest in all three algorithms using three completely different importance measures, that is the strongest possible evidence it genuinely matters. Single-model importance rankings can be misleading due to correlated features or algorithm-specific quirks, but cross-model agreement is very reliable.
+
+
+---
+
+## 4.2 Partial Dependence Plots (10 points)
+
+Create PDPs for the top important features to understand the *direction* and *shape* of their effects.
+
+```{r pdp-analysis}
+# 1. Create PDPs for at least 3 of the top important features
+# Using the pdp package on the best regression model (XGBoost)
+
+# PDP for kw_avg_avg (most important feature across all models)
+pdp_kw_avg_avg <- partial(xgb_final,
+                          pred.var = "kw_avg_avg",
+                          train    = train_matrix,
+                          type     = "regression")
+
+plot(pdp_kw_avg_avg,
+     main = "PDP — kw_avg_avg",
+     xlab = "kw_avg_avg (Average Shares of Best Keyword)",
+     ylab = "Predicted log(shares)",
+     col  = "#2196F3",
+     lwd  = 2,
+     type = "l")
+
+# PDP for n_unique_tokens (2nd most important in RF)
+pdp_n_unique <- partial(xgb_final,
+                        pred.var = "n_unique_tokens",
+                        train    = train_matrix,
+                        type     = "regression")
+
+plot(pdp_n_unique,
+     main = "PDP — n_unique_tokens",
+     xlab = "n_unique_tokens (Ratio of Unique Words)",
+     ylab = "Predicted log(shares)",
+     col  = "#FF5722",
+     lwd  = 2,
+     type = "l")
+
+# PDP for num_hrefs (consistent across all models)
+pdp_num_hrefs <- partial(xgb_final,
+                         pred.var = "num_hrefs",
+                         train    = train_matrix,
+                         type     = "regression")
+
+plot(pdp_num_hrefs,
+     main = "PDP — num_hrefs",
+     xlab = "num_hrefs (Number of Links in Article)",
+     ylab = "Predicted log(shares)",
+     col  = "#4CAF50",
+     lwd  = 2,
+     type = "l")
+
+# PDP for is_weekend (important timing feature)
+pdp_is_weekend <- partial(xgb_final,
+                          pred.var = "is_weekend",
+                          train    = train_matrix,
+                          type     = "regression")
+
+plot(pdp_is_weekend,
+     main = "PDP — is_weekend",
+     xlab = "is_weekend (0 = Weekday, 1 = Weekend)",
+     ylab = "Predicted log(shares)",
+     col  = "#9C27B0",
+     lwd  = 2,
+     type = "l")
+
+# 2. For classification models, use which.class to show predicted probability of Popular
+# PDP for kw_avg_avg using RF classification model
+pdp_kw_cls <- partial(rf_cls_model,
+                      pred.var    = "kw_avg_avg",
+                      train       = train_cls,
+                      which.class = "Popular",
+                      type        = "classification",
+                      prob        = TRUE)
+
+plot(pdp_kw_cls,
+     main = "PDP — kw_avg_avg (Classification)",
+     xlab = "kw_avg_avg",
+     ylab = "Predicted Probability of Popular",
+     col  = "#2196F3",
+     lwd  = 2,
+     type = "l")
+
+# 3. Interpret the shape of each PDP: linear, monotone, non-linear, threshold effects
+cat("PDP analysis complete\n")
+
+```
+
+#### **Question 15 (10 points):** Interpret each PDP. What is the direction of each feature's effect on popularity? Are any relationships non-linear? Do you observe threshold effects (e.g., a feature only matters beyond a certain value)? How do these relationships align with your intuition about what makes news articles popular?
+
+**Your Answer:**
+PDP — kw_avg_avg (Regression and Classification):
+This is the most interesting PDP of all four. The relationship is clearly non-linear with a strong threshold effect. When kw_avg_avg is below about 3,000-5,000 shares, predicted log(shares) sits around 7.3 — relatively low. Then there is a sharp jump upward between 0 and 10,000, after which the curve completely flattens out and stays constant all the way to 40,000+. This means there is a critical threshold around 5,000-10,000 average keyword shares — articles using keywords associated with that level of popularity get a significant boost, but beyond that point additional keyword popularity gives no further benefit. The classification PDP confirms the same story — the probability of being popular jumps from about 0.48 to over 0.56 in that same range, then plateaus. This is a textbook threshold effect.
+
+PDP — n_unique_tokens:
+This plot shows a very sharp drop right at the very beginning — when n_unique_tokens is close to zero, predicted shares are highest (around 7.56), and they drop steeply and immediately to about 7.47 and then completely flatten for the rest of the range up to 700. This is unusual and suggests the relationship is driven by a small number of extreme outlier articles with near-zero unique token ratios rather than a genuine trend. In practical terms, vocabulary diversity does not seem to have a meaningful monotone relationship with shares — the effect is concentrated entirely at the extreme low end.
+
+PDP — num_hrefs:
+This plot shows a clear monotone increasing relationship — more links in an article consistently predicts more shares. The curve starts at about 7.4 predicted log(shares) with zero links and rises steadily to about 7.8 with 150+ links. The relationship is not perfectly linear — it rises more steeply at first and then gradually levels off, suggesting diminishing returns beyond about 100 links. This makes intuitive sense — a well-researched article with many external references signals quality and credibility to readers, which encourages sharing. There is no threshold effect here, just a smooth and consistent positive relationship.
+
+PDP — is_weekend:
+This plot shows a clean linear positive relationship between publishing on a weekend and predicted shares. Articles published on weekdays (0) have a predicted log(shares) of about 7.44, while weekend articles (1) sit at about 7.63 — a meaningful difference of about 0.19 on the log scale. Since this is a binary variable the line goes straight from 0 to 1, but the direction and magnitude are very clear. This aligns perfectly with what I found in the EDA — Saturday and Sunday articles are significantly more likely to be popular, likely because less content is published and readers have more leisure time to browse and share.
+
+Do these relationships align with intuition:
+Yes, all four plots make real-world sense. Popular keywords signal that you are writing about topics people already care about. More links signal a well-researched thorough article. Weekend publishing reduces competition. The only surprising one is n_unique_tokens which does not behave as expected — you might assume richer vocabulary leads to more shares, but the data does not support that story.
+---
+
+## 4.3 Actionable Insights & Conclusion (5 points)
+
+#### **Question 16 (5 points):** Based on your complete analysis — exploratory findings, model performance, feature importance, and PDPs — provide **at least 5 specific, actionable recommendations** for content creators at Mashable to increase article popularity. Each recommendation should be grounded in evidence from your analysis (cite specific features, PDP shapes, or statistics). Also reflect on the limitations of your analysis and areas for future improvement.
+
+**Your Answer:**
+Based on everything found in this analysis — the EDA patterns, model performance, feature importance rankings, and PDP shapes — here are five specific recommendations for content creators at Mashable:
+
+Recommendation 1: Use keywords that are already associated with popular content
+The single strongest signal in every model built was kw_avg_avg — the average shares of articles that share the same keywords. The PDP showed a clear threshold effect: once keywords are associated with around 5,000-10,000 average shares, predicted popularity jumps significantly and then plateaus. The practical advice is simple — before writing an article, research which keywords Mashable's most-shared articles use and deliberately incorporate those keywords into the content. Writing about the right topic in the right keyword space matters more than almost anything else in this dataset.
+
+Recommendation 2: Publish on weekends whenever possible
+The is_weekend PDP showed a clear and consistent positive effect — weekend articles have a predicted log(shares) about 0.19 higher than weekday articles, translating to roughly 20% more shares on average. The EDA confirmed this dramatically: Saturday articles are popular 74.52% of the time versus only around 50% on Tuesday and Wednesday. Far fewer articles are published on weekends, so each one faces less competition and gets more reader attention. If the content is not time-sensitive, holding it for Saturday or Sunday is a smart strategy.
+
+Recommendation 3: Write well-researched articles with many external links
+The num_hrefs PDP showed a smooth, consistent, monotone positive relationship — every additional link is associated with more predicted shares, all the way up to 150+ links. Articles with zero links had a predicted log(shares) of about 7.4, while articles with 150+ links reached 7.8. Readers and social media users perceive heavily referenced articles as more credible, thorough, and worth sharing. This does not mean stuffing links randomly — it means doing genuine research and citing sources properly.
+
+Recommendation 4: Focus on Social Media and Tech topics
+The channel analysis showed that Social Media articles are popular 75.76% of the time and Tech articles 64.12% of the time, compared to only 38.55% for World news and 41.12% for Entertainment. The data channel features also appeared consistently in the feature importance rankings. If there is flexibility in what topics to cover, Social Media and Tech content gives a dramatically higher baseline probability of popularity before a single word is written.
+
+Recommendation 5: Leverage self-referencing strategically
+Both self_reference_min_shares and self_reference_avg_sharess ranked highly in GBM (5.98 and 6.07 relative influence) and XGBoost (0.0434 and 0.0425 gain). These features measure how popular the Mashable articles referenced within the current article were. Linking back to previously popular Mashable content is associated with higher shares — possibly because it signals the article is part of an ongoing popular conversation. When writing a new article, deliberately linking to Mashable's own highest-performing related articles is a worthwhile strategy.
+
+Limitations and Future Improvements:
+There are several important limitations to acknowledge. The AUC of 0.7422 and RMSPE of 0.8462, while better than the benchmarks, still leave a lot of variance unexplained — predicting virality is genuinely hard and these models are not perfect. All features in this dataset were measured before publication, but some of the strongest predictors like self_reference and kw_avg_avg require knowledge of the existing content landscape, which may not always be easy to control directly. This dataset also covers articles from 2013-2015 on Mashable specifically — reader behavior and platform algorithms have changed significantly since then, and the findings may not generalize perfectly to today's content environment. Future work could incorporate more recent data, add features like social media engagement timing, or use natural language processing on the actual article text rather than just metadata.
+
+---
+
+# Bonus: Stacked Ensemble (15 bonus points) {#bonus}
+
+**Stacking** (also called **stacked generalization**) is an ensemble technique that combines the predictions of multiple diverse models using a **meta-learner**. The idea is that different models capture different patterns in the data, and a meta-learner can learn the optimal way to combine their predictions — often outperforming any individual model.
+
+### How Stacking Works
+
+1. **Train base models**: You already have three base models — Random Forest, GBM, and XGBoost.
+2. **Generate out-of-fold predictions**: To avoid data leakage, base model predictions for the meta-learner must be generated on data the base model **did not** train on. Use k-fold cross-validation:
+   - Split training data into k folds
+   - For each fold, train each base model on the other k−1 folds and predict on the held-out fold
+   - After all folds, you have OOF (out-of-fold) predictions from each base model for every training observation
+3. **Train the meta-learner**: Use the OOF predictions as **new features** (one column per base model) and the original target as the response. A simple model works best — linear regression (for regression) or logistic regression (for classification).
+4. **Make final predictions**: For the test set, predict with each base model (trained on full training data), then feed those predictions into the meta-learner.
+
+### Why Stacking Works
+
+Each base model makes **different errors** on different observations. If RF overpredicts for certain types of articles while XGBoost underpredicts for those same articles, a meta-learner can learn to weight their predictions optimally. The key requirement is **model diversity** — stacking works best when base models are substantially different (which RF, GBM, and XGBoost are, due to their different learning mechanisms).
+
+### Your Task
+
+Implement stacking for **both** the regression and classification tasks.
+
+```{r stacking-regression, cache=TRUE}
+# 1. Set up k-fold CV (e.g., k = 5) on the training data
+# Skip if already computed
+if(!exists("stack_rmspe")){
+
+set.seed(42)
+k       <- 5
+folds   <- cut(sample(1:nrow(train_reg)), breaks = k, labels = FALSE)
+
+# Create empty OOF prediction vectors
+oof_rf  <- numeric(nrow(train_reg))
+oof_gbm <- numeric(nrow(train_reg))
+oof_xgb <- numeric(nrow(train_reg))
+
+# 2. For each fold:
+#    a. Train RF, GBM, XGBoost on the training folds
+#    b. Predict on the held-out fold → store as OOF predictions
+for(fold in 1:k){
+  val_idx   <- which(folds == fold)
+  train_idx <- which(folds != fold)
+  fold_train <- train_reg[train_idx, ]
+  fold_val   <- train_reg[val_idx, ]
+  rf_fold <- randomForest(log_shares ~ .,
+                          data  = fold_train,
+                          ntree = 500)
+  oof_rf[val_idx] <- predict(rf_fold, newdata = fold_val)
+  gbm_fold <- gbm(log_shares ~ .,
+                  data              = fold_train,
+                  distribution      = "gaussian",
+                  n.trees           = best_gbm_row$best_n_trees,
+                  shrinkage         = best_gbm_row$shrinkage,
+                  interaction.depth = best_gbm_row$interaction.depth,
+                  n.minobsinnode    = best_gbm_row$n.minobsinnode,
+                  bag.fraction      = best_gbm_row$bag.fraction,
+                  verbose           = FALSE)
+  oof_gbm[val_idx] <- predict(gbm_fold,
+                               newdata = fold_val,
+                               n.trees = best_gbm_row$best_n_trees)
+  fold_matrix     <- model.matrix(log_shares ~ . - 1, data = fold_train)
+  fold_val_matrix <- model.matrix(log_shares ~ . - 1, data = fold_val)
+  fold_label      <- fold_train$log_shares
+  xgb_fold <- xgboost(
+    x                = fold_matrix,
+    y                = fold_label,
+    nrounds          = best_xgb_row$best_nrounds,
+    max_depth        = best_xgb_row$max_depth,
+    learning_rate    = best_xgb_row$eta,
+    subsample        = best_xgb_row$subsample,
+    colsample_bytree = best_xgb_row$colsample_bytree,
+    objective        = "reg:squarederror",
+    eval_metric      = "rmse"
+  )
+  oof_xgb[val_idx] <- predict(xgb_fold, newdata = fold_val_matrix)
+  cat("Fold", fold, "complete\n")
+}
+
+# 3. After all folds: you have 3 columns of OOF predictions (one per model)
+oof_df <- data.frame(
+  rf_pred    = oof_rf,
+  gbm_pred   = oof_gbm,
+  xgb_pred   = oof_xgb,
+  log_shares = train_reg$log_shares
+)
+
+# 4. Train a meta-learner: lm(shares ~ rf_pred + gbm_pred + xgb_pred)
+meta_reg <- lm(log_shares ~ rf_pred + gbm_pred + xgb_pred, data = oof_df)
+
+# 5. For the test set:
+#    a. Predict with each base model (trained on FULL training data)
+#    b. Feed into the meta-learner
+test_rf_pred  <- predict(rf_reg_model, newdata = test_reg)
+test_gbm_pred <- predict(gbm_final,
+                         newdata = test_reg,
+                         n.trees = best_gbm_row$best_n_trees)
+test_xgb_pred <- predict(xgb_final, newdata = test_matrix)
+test_stack_df <- data.frame(
+  rf_pred  = test_rf_pred,
+  gbm_pred = test_gbm_pred,
+  xgb_pred = test_xgb_pred
+)
+stack_pred_reg <- predict(meta_reg, newdata = test_stack_df)
+
+# 6. Compute test RMSPE for the stacked ensemble
+stack_rmspe <- sqrt(mean((test_reg$log_shares - stack_pred_reg)^2))
+
+} # end if
+
+# 7. Compare to individual models
+cat("\nMeta-learner coefficients:\n")
+print(summary(meta_reg)$coefficients)
+cat("\nModel Comparison:\n")
+cat("Linear Regression RMSPE:", round(lm_rmspe,   4), "\n")
+cat("Random Forest RMSPE:    ", round(rf_rmspe,   4), "\n")
+cat("GBM RMSPE:              ", round(gbm_rmspe,  4), "\n")
+cat("XGBoost RMSPE:          ", round(xgb_rmspe,  4), "\n")
+cat("Stacked Ensemble RMSPE: ", round(stack_rmspe, 4), "\n")
+```
+
+```{r stacking-classification, cache=TRUE}
+# Same approach but:
+# - Base model predictions are predicted PROBABILITIES (not class labels)
+# - Meta-learner: glm(popular ~ rf_prob + gbm_prob + xgb_prob, family = binomial)
+# - Evaluate with AUC
+
+# Skip if already computed
+if(!exists("stack_auc")){
+
+set.seed(42)
+folds_cls <- cut(sample(1:nrow(train_cls)), breaks = k, labels = FALSE)
+
+# Create empty OOF probability vectors
+oof_rf_prob  <- numeric(nrow(train_cls))
+oof_gbm_prob <- numeric(nrow(train_cls))
+oof_xgb_prob <- numeric(nrow(train_cls))
+
+for(fold in 1:k){
+  val_idx   <- which(folds_cls == fold)
+  train_idx <- which(folds_cls != fold)
+  fold_train_cls <- train_cls[train_idx, ]
+  fold_val_cls   <- train_cls[val_idx, ]
+
+  # Random Forest probabilities
+  rf_fold_cls <- randomForest(popular ~ .,
+                              data  = fold_train_cls,
+                              ntree = 500)
+  oof_rf_prob[val_idx] <- predict(rf_fold_cls,
+                                  newdata = fold_val_cls,
+                                  type    = "prob")[, "Popular"]
+
+  # GBM probabilities
+  fold_train_gbm <- fold_train_cls %>%
+    mutate(popular = ifelse(popular == "Popular", 1, 0))
+  fold_val_gbm <- fold_val_cls %>%
+    mutate(popular = ifelse(popular == "Popular", 1, 0))
+
+  gbm_fold_cls <- gbm(popular ~ .,
+                      data              = fold_train_gbm,
+                      distribution      = "bernoulli",
+                      n.trees           = best_gbm_cls_row$best_n_trees,
+                      shrinkage         = best_gbm_cls_row$shrinkage,
+                      interaction.depth = best_gbm_cls_row$interaction.depth,
+                      n.minobsinnode    = best_gbm_cls_row$n.minobsinnode,
+                      bag.fraction      = best_gbm_cls_row$bag.fraction,
+                      verbose           = FALSE)
+  oof_gbm_prob[val_idx] <- predict(gbm_fold_cls,
+                                    newdata = fold_val_gbm,
+                                    n.trees = best_gbm_cls_row$best_n_trees,
+                                    type    = "response")
+
+  # XGBoost probabilities
+  fold_matrix_cls     <- model.matrix(popular ~ . - 1, data = fold_train_cls)
+  fold_val_matrix_cls <- model.matrix(popular ~ . - 1, data = fold_val_cls)
+  fold_label_cls      <- ifelse(fold_train_cls$popular == "Popular", 1, 0)
+
+  xgb_fold_cls <- xgboost(
+    x                = fold_matrix_cls,
+    y                = factor(fold_label_cls),
+    nrounds          = best_xgb_cls_row$best_nrounds,
+    max_depth        = best_xgb_cls_row$max_depth,
+    learning_rate    = best_xgb_cls_row$eta,
+    subsample        = best_xgb_cls_row$subsample,
+    colsample_bytree = best_xgb_cls_row$colsample_bytree,
+    objective        = "binary:logistic",
+    eval_metric      = "auc"
+  )
+  oof_xgb_prob[val_idx] <- predict(xgb_fold_cls,
+                                    newdata = fold_val_matrix_cls)
+
+  cat("Fold", fold, "complete\n")
+}
+
+# Train meta-learner on OOF probabilities
+oof_cls_df <- data.frame(
+  rf_prob  = oof_rf_prob,
+  gbm_prob = oof_gbm_prob,
+  xgb_prob = oof_xgb_prob,
+  popular  = train_cls$popular
+)
+
+meta_cls <- glm(popular ~ rf_prob + gbm_prob + xgb_prob,
+                data   = oof_cls_df,
+                family = binomial)
+
+# Predict on test set
+test_rf_prob  <- predict(rf_cls_model,
+                         newdata = test_cls,
+                         type    = "prob")[, "Popular"]
+test_gbm_prob <- predict(gbm_cls_final,
+                         newdata = test_cls_gbm,
+                         n.trees = best_gbm_cls_row$best_n_trees,
+                         type    = "response")
+test_xgb_prob <- predict(xgb_cls_final, newdata = test_matrix_cls)
+
+test_stack_cls_df <- data.frame(
+  rf_prob  = test_rf_prob,
+  gbm_prob = test_gbm_prob,
+  xgb_prob = test_xgb_prob
+)
+
+stack_prob_cls <- predict(meta_cls,
+                          newdata = test_stack_cls_df,
+                          type    = "response")
+
+# Evaluate with AUC
+stack_pred_obj <- prediction(stack_prob_cls, test_cls$popular)
+stack_auc_perf <- performance(stack_pred_obj, measure = "auc")
+stack_auc      <- round(stack_auc_perf@y.values[[1]], 4)
+
+} # end if
+
+# Print results
+cat("\nMeta-learner coefficients:\n")
+print(summary(meta_cls)$coefficients)
+cat("\nModel Comparison:\n")
+cat("Logistic Regression AUC:", round(logit_auc, 4), "\n")
+cat("Random Forest AUC:      ", round(rf_auc,    4), "\n")
+cat("GBM AUC:                ", round(gbm_auc,   4), "\n")
+cat("XGBoost AUC:            ", round(xgb_auc,   4), "\n")
+cat("Stacked Ensemble AUC:   ", stack_auc,            "\n")
+```
+
+#### **Bonus Question (15 points):** Does the stacked ensemble outperform the individual models? Report the stacked ensemble's RMSPE (regression) and AUC (classification) alongside the individual model results. Examine the meta-learner coefficients — which base model received the most weight? What does this tell you about the relative strengths of the base models? Discuss when stacking is most beneficial and when it might not help.
+
+**Your Answer:**
+Does the stacked ensemble outperform the individual models?
+For regression, the stacked ensemble achieved an RMSPE of 0.8460, which is marginally better than XGBoost alone at 0.8462 — a difference of just 0.0002. For classification, the stacked ensemble achieved an AUC of 0.7423, compared to XGBoost's 0.7422 — again an extremely tiny improvement of just 0.0001. In both cases the stack technically wins but by such a small margin that it is practically negligible.
+
+Regression meta-learner coefficients — which base model received the most weight:
+XGBoost received the highest coefficient of 0.699, meaning the meta-learner assigned roughly 70% of the weight to XGBoost predictions. Random Forest received 0.155 and GBM received 0.163. The meta-learner essentially learned that XGBoost is the most reliable base model and leaned heavily on it, using RF and GBM only as minor corrections.
+
+Classification meta-learner coefficients:
+The pattern is even more striking in classification. XGBoost received a coefficient of 4.016, by far the largest and highly significant with a p-value of 1.19e-21. Random Forest received 0.950 and is also significant with a p-value of 8.17e-06. GBM however received a negative coefficient of -0.082 and is completely insignificant with a p-value of 0.833 — meaning the meta-learner effectively ignored GBM entirely in the classification task. This tells us that for classification, XGBoost and Random Forest are capturing genuinely useful and complementary signals, while GBM adds nothing beyond what the other two already provide.
+
+What does this tell us about the relative strengths of the base models:
+Across both regression and classification, XGBoost is clearly the dominant model. The meta-learner independently discovered the same ranking I found in individual model comparisons without being told. The fact that GBM was ignored in classification but contributed in regression suggests GBM's strength is more in continuous prediction tasks than binary classification on this particular dataset.
+
+When is stacking most beneficial and when might it not help:
+Stacking works best when base models make very different errors on different observations. In this dataset, RF, GBM, and XGBoost are all tree-based methods that tend to make similar errors on the same observations, which is why the improvement from stacking is so tiny — just 0.0002 in RMSPE and 0.0001 in AUC. Stacking would be much more powerful if I combined fundamentally different model types such as a neural network, a linear model, and a tree-based model together. The key lesson is that model diversity drives stacking performance, and three variations of tree-based models simply do not provide enough diversity to generate meaningful gains beyond what the best individual model already achieves.
+---
+
+# Submission Checklist
+
+Before submitting, ensure:
+
+- [ ] All code chunks run without errors
+- [ ] All questions answered with explanations (not just code output)
+- [ ] Plots are properly labeled with titles and axis labels
+- [ ] **Part 1:** Summary statistics table, popularity distribution, channel/weekday tables, ggplot visualizations
+- [ ] **Part 2:** All 4 regression models trained (LM, RF, GBM, XGBoost), comparison table with RMSPE, mean RMSPE ± SD for best model
+- [ ] **Part 3:** All 4 classification models trained (Logistic, RF, GBM, XGBoost), comparison table with AUC, mean AUC ± SD for best model, confusion matrix
+- [ ] **Part 4:** Feature importance plots, PDPs, actionable insights
+- [ ] Tables formatted with `kable`/`kableExtra` (not raw console output)
+- [ ] No use of `caret` or `h2o` for hyperparameter tuning
+- [ ] Team members listed in author field
+- [ ] LLM usage disclosed (if applicable)
+- [ ] Both `.qmd` and `.html` files submitted
+
+---
+
+**Final Note:** This project would be a great addition to your portfolio. Make sure to include it in your resume and LinkedIn profile. You can also use it as a case study in interviews. Good luck!
